@@ -1,4 +1,3 @@
-
 name: CI/CD - ESSS Challenge
 
 on:
@@ -13,7 +12,7 @@ permissions:
 jobs:
   validate:
     name: Validate application
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     steps:
       - name: Checkout repository
@@ -34,13 +33,12 @@ jobs:
         run: python -m compileall -q api
 
       - name: Validate Docker Compose configuration
-        env:
-          POSTGRES_PASSWORD: ci-validation-only
-        run: docker compose config --quiet
+        run: |
+          POSTGRES_PASSWORD="$(openssl rand -hex 16)" docker compose config --quiet
 
   deploy:
     name: Deploy to EC2
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: validate
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
@@ -54,6 +52,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          test -n "$EC2_HOST"
+          test -n "$EC2_USER"
+          test -n "$EC2_SSH_PORT"
+          test -n "$EC2_SSH_PRIVATE_KEY"
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
 
@@ -62,12 +65,55 @@ jobs:
 
           ssh-keyscan -p "$EC2_SSH_PORT" "$EC2_HOST" >> ~/.ssh/known_hosts
 
-          ssh \
-            -i ~/.ssh/deploy_key \
+          DEPLOY_DIR="/home/$EC2_USER/desafio-esss"
+
+          ssh -i ~/.ssh/deploy_key \
             -p "$EC2_SSH_PORT" \
             -o IdentitiesOnly=yes \
             "$EC2_USER@$EC2_HOST" \
-            'cd ~/desafio-esss && git pull --ff-only origin main && sudo docker compose up -d --build && sudo docker compose ps && curl --fail --silent --show-error http://localhost:8000/health'
+            "mkdir -p '$DEPLOY_DIR'"
 
-          rm -f ~/.ssh/deploy_key
+          tar \
+            --exclude=.git \
+            --exclude=.env \
+            --exclude=.venv \
+            --exclude=__pycache__ \
+            -czf /tmp/desafio-esss.tar.gz .
 
+          scp -i ~/.ssh/deploy_key \
+            -P "$EC2_SSH_PORT" \
+            -o IdentitiesOnly=yes \
+            /tmp/desafio-esss.tar.gz \
+            "$EC2_USER@$EC2_HOST:/tmp/desafio-esss.tar.gz"
+
+          ssh -i ~/.ssh/deploy_key \
+            -p "$EC2_SSH_PORT" \
+            -o IdentitiesOnly=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "set -eu
+            tar -xzf /tmp/desafio-esss.tar.gz -C '$DEPLOY_DIR'
+            rm -f /tmp/desafio-esss.tar.gz
+            cd '$DEPLOY_DIR'
+            sudo docker compose up -d --build
+            sudo docker compose ps"
+
+          ATTEMPTS=12
+          DELAY=5
+          HEALTH_CHECK='for attempt in $(seq 1 12); do
+            if curl --fail --silent --show-error --max-time 5 http://localhost:8000/health; then
+              echo "Health check successful on attempt $attempt"
+              exit 0
+            fi
+            echo "Attempt $attempt/12 failed; waiting 5s..."
+            sleep 5
+          done
+          echo "Health check failed after 12 attempts."
+          exit 1'
+
+          ssh -i ~/.ssh/deploy_key \
+            -p "$EC2_SSH_PORT" \
+            -o IdentitiesOnly=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "$HEALTH_CHECK"
+
+          rm -f ~/.ssh/deploy_key /tmp/desafio-esss.tar.gz
