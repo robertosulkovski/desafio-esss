@@ -240,7 +240,7 @@ O pipeline CI/CD é acionado automaticamente a cada push para a branch main. A e
 
 ### Vídeo de demonstração
 
-_A adicionar após a gravação._
+https://drive.google.com/file/d/1s0jr5QOssfCozVssN0s2Nw2h9C4MNoxV/view?usp=sharing
 
 O vídeo deverá demonstrar o push para `main`, a execução dos jobs de validação e implantação, o resultado do health check e uma requisição bem-sucedida à API implantada.
 
