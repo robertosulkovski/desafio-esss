@@ -1,3 +1,4 @@
+
 name: CI/CD - ESSS Challenge
 
 on:
@@ -33,8 +34,9 @@ jobs:
         run: python -m compileall -q api
 
       - name: Validate Docker Compose configuration
-        run: |
-          POSTGRES_PASSWORD="$(openssl rand -hex 16)" docker compose config --quiet
+        env:
+          POSTGRES_PASSWORD: ci-validation-only
+        run: docker compose config --quiet
 
   deploy:
     name: Deploy to EC2
@@ -52,68 +54,80 @@ jobs:
         run: |
           set -euo pipefail
 
-          test -n "$EC2_HOST"
-          test -n "$EC2_USER"
-          test -n "$EC2_SSH_PORT"
-          test -n "$EC2_SSH_PRIVATE_KEY"
+          : "${EC2_HOST:?EC2_HOST não configurado}"
+          : "${EC2_USER:?EC2_USER não configurado}"
+          : "${EC2_SSH_PORT:?EC2_SSH_PORT não configurado}"
+          : "${EC2_SSH_PRIVATE_KEY:?EC2_SSH_PRIVATE_KEY não configurado}"
 
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
+          DEPLOY_DIR="/home/${EC2_USER}/desafio-esss"
+          KEY_FILE="$(mktemp)"
+          ARCHIVE="/tmp/desafio-esss-${GITHUB_RUN_ID}.tar.gz"
 
-          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
+          cleanup() {
+            rm -f "$KEY_FILE" "$ARCHIVE"
+          }
+          trap cleanup EXIT
 
-          ssh-keyscan -p "$EC2_SSH_PORT" "$EC2_HOST" >> ~/.ssh/known_hosts
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
 
-          DEPLOY_DIR="/home/$EC2_USER/desafio-esss"
+          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
 
-          ssh -i ~/.ssh/deploy_key \
-            -p "$EC2_SSH_PORT" \
-            -o IdentitiesOnly=yes \
+          # Registrar a chave do servidor antes de conectar.
+          # Em produção, prefira validar uma fingerprint obtida por canal confiável.
+          ssh-keyscan -p "$EC2_SSH_PORT" "$EC2_HOST" \
+            >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+          SSH_OPTS="-p $EC2_SSH_PORT -o IdentitiesOnly=yes -o BatchMode=yes"
+
+          ssh -i "$KEY_FILE" $SSH_OPTS \
             "$EC2_USER@$EC2_HOST" \
             "mkdir -p '$DEPLOY_DIR'"
 
+          # Empacotar os arquivos do repositório sem segredos locais.
           tar \
             --exclude=.git \
             --exclude=.env \
             --exclude=.venv \
             --exclude=__pycache__ \
-            -czf /tmp/desafio-esss.tar.gz .
+            --exclude='*.pyc' \
+            -czf "$ARCHIVE" .
 
-          scp -i ~/.ssh/deploy_key \
+          scp -i "$KEY_FILE" \
             -P "$EC2_SSH_PORT" \
             -o IdentitiesOnly=yes \
-            /tmp/desafio-esss.tar.gz \
-            "$EC2_USER@$EC2_HOST:/tmp/desafio-esss.tar.gz"
+            -o BatchMode=yes \
+            "$ARCHIVE" \
+            "$EC2_USER@$EC2_HOST:/tmp/desafio-esss-${GITHUB_RUN_ID}.tar.gz"
 
-          ssh -i ~/.ssh/deploy_key \
-            -p "$EC2_SSH_PORT" \
-            -o IdentitiesOnly=yes \
+          # Extrair e aplicar a versão nova da aplicação.
+          ssh -i "$KEY_FILE" $SSH_OPTS \
             "$EC2_USER@$EC2_HOST" \
             "set -eu
-            tar -xzf /tmp/desafio-esss.tar.gz -C '$DEPLOY_DIR'
-            rm -f /tmp/desafio-esss.tar.gz
+            tar -xzf '/tmp/desafio-esss-${GITHUB_RUN_ID}.tar.gz' -C '$DEPLOY_DIR'
+            rm -f '/tmp/desafio-esss-${GITHUB_RUN_ID}.tar.gz'
             cd '$DEPLOY_DIR'
             sudo docker compose up -d --build
             sudo docker compose ps"
 
-          ATTEMPTS=12
-          DELAY=5
-          HEALTH_CHECK='for attempt in $(seq 1 12); do
-            if curl --fail --silent --show-error --max-time 5 http://localhost:8000/health; then
-              echo "Health check successful on attempt $attempt"
-              exit 0
-            fi
-            echo "Attempt $attempt/12 failed; waiting 5s..."
-            sleep 5
-          done
-          echo "Health check failed after 12 attempts."
-          exit 1'
-
-          ssh -i ~/.ssh/deploy_key \
-            -p "$EC2_SSH_PORT" \
-            -o IdentitiesOnly=yes \
+          # Health check: aceitar exclusivamente HTTP 200.
+          ssh -i "$KEY_FILE" $SSH_OPTS \
             "$EC2_USER@$EC2_HOST" \
-            "$HEALTH_CHECK"
+            'for attempt in $(seq 1 12); do
+              status=$(curl --silent --output /dev/null \
+                --write-out "%{http_code}" --max-time 5 \
+                http://localhost:8000/health || true)
 
-          rm -f ~/.ssh/deploy_key /tmp/desafio-esss.tar.gz
+              if [ "$status" = "200" ]; then
+                echo "Health check successful: HTTP 200 (attempt $attempt/12)"
+                exit 0
+              fi
+
+              echo "Health check attempt $attempt/12 returned HTTP ${status:-000}"
+              sleep 5
+            done
+
+            echo "Health check failed after 12 attempts"
+            exit 1'
