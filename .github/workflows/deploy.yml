@@ -75,7 +75,7 @@ jobs:
           chmod 600 "$KEY_FILE"
 
           # Registrar a chave do servidor antes de conectar.
-          # Em produção, prefira validar uma fingerprint obtida por canal confiável.
+          # Em produção, valide a fingerprint por um canal confiável.
           ssh-keyscan -p "$EC2_SSH_PORT" "$EC2_HOST" \
             >> "$HOME/.ssh/known_hosts" 2>/dev/null
           chmod 600 "$HOME/.ssh/known_hosts"
@@ -86,7 +86,7 @@ jobs:
             "$EC2_USER@$EC2_HOST" \
             "mkdir -p '$DEPLOY_DIR'"
 
-          # Empacotar os arquivos do repositório sem segredos locais.
+          # Empacotar os arquivos sem segredos locais.
           tar \
             --exclude=.git \
             --exclude=.env \
@@ -102,7 +102,7 @@ jobs:
             "$ARCHIVE" \
             "$EC2_USER@$EC2_HOST:/tmp/desafio-esss-${GITHUB_RUN_ID}.tar.gz"
 
-          # Extrair e aplicar a versão nova da aplicação.
+          # Extrair os arquivos e implantar a aplicação.
           ssh -i "$KEY_FILE" $SSH_OPTS \
             "$EC2_USER@$EC2_HOST" \
             "set -eu
@@ -112,22 +112,8 @@ jobs:
             sudo docker compose up -d --build
             sudo docker compose ps"
 
-          # Health check: aceitar exclusivamente HTTP 200.
+          # Executar o script de health check no servidor remoto.
           ssh -i "$KEY_FILE" $SSH_OPTS \
             "$EC2_USER@$EC2_HOST" \
-            'for attempt in $(seq 1 12); do
-              status=$(curl --silent --output /dev/null \
-                --write-out "%{http_code}" --max-time 5 \
-                http://localhost:8000/health || true)
-
-              if [ "$status" = "200" ]; then
-                echo "Health check successful: HTTP 200 (attempt $attempt/12)"
-                exit 0
-              fi
-
-              echo "Health check attempt $attempt/12 returned HTTP ${status:-000}"
-              sleep 5
-            done
-
-            echo "Health check failed after 12 attempts"
-            exit 1'
+            "bash '$DEPLOY_DIR/scripts/healthcheck.sh' \
+            http://localhost:8000/health 12 5"
