@@ -38,6 +38,9 @@ jobs:
           POSTGRES_PASSWORD: ci-validation-only
         run: docker compose config --quiet
 
+      - name: Validate health check script
+        run: bash -n scripts/healthcheck.sh
+
   deploy:
     name: Deploy to EC2
     runs-on: self-hosted
@@ -51,17 +54,21 @@ jobs:
           EC2_USER: ${{ vars.EC2_USER }}
           EC2_SSH_PORT: ${{ vars.EC2_SSH_PORT }}
           EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+        shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
           : "${EC2_HOST:?EC2_HOST não configurado}"
           : "${EC2_USER:?EC2_USER não configurado}"
           : "${EC2_SSH_PORT:?EC2_SSH_PORT não configurado}"
           : "${EC2_SSH_PRIVATE_KEY:?EC2_SSH_PRIVATE_KEY não configurado}"
 
+          EXPECTED_FINGERPRINT="SHA256:5p+4gp/bdJUKmGZQ6BMcC+KXVaT53mYG1YdlqsVRY1I"
+
           DEPLOY_DIR="/home/${EC2_USER}/desafio-esss"
           KEY_FILE="$(mktemp)"
           ARCHIVE="/tmp/desafio-esss-${GITHUB_RUN_ID}.tar.gz"
+          KNOWN_HOSTS="$HOME/.ssh/known_hosts"
 
           cleanup() {
             rm -f "$KEY_FILE" "$ARCHIVE"
@@ -70,19 +77,64 @@ jobs:
 
           mkdir -p "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
+          touch "$KNOWN_HOSTS"
+          chmod 600 "$KNOWN_HOSTS"
 
           printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > "$KEY_FILE"
           chmod 600 "$KEY_FILE"
 
-          # Registrar a chave do servidor antes de conectar.
-          # Em produção, valide a fingerprint por um canal confiável.
-          ssh-keyscan -p "$EC2_SSH_PORT" "$EC2_HOST" \
-            >> "$HOME/.ssh/known_hosts" 2>/dev/null
-          chmod 600 "$HOME/.ssh/known_hosts"
+          # Obter a chave pública apresentada pelo servidor.
+          if ! SCAN_RESULT="$(ssh-keyscan -T 10 -t ed25519 \
+            -p "$EC2_SSH_PORT" "$EC2_HOST" 2>/dev/null)" ||
+            [ -z "$SCAN_RESULT" ]; then
+            echo "Erro: não foi possível obter a chave SSH do servidor."
+            exit 1
+          fi
 
-          SSH_OPTS="-p $EC2_SSH_PORT -o IdentitiesOnly=yes -o BatchMode=yes"
+          # Conferir a fingerprint antes de confiar na chave.
+          if ! ACTUAL_FINGERPRINT="$(
+            printf '%s\n' "$SCAN_RESULT" |
+              ssh-keygen -lf - 2>/dev/null |
+              awk 'NR == 1 { print $2 }'
+          )"; then
+            echo "Erro: não foi possível calcular a fingerprint SSH."
+            exit 1
+          fi
 
-          ssh -i "$KEY_FILE" $SSH_OPTS \
+          if [ "$ACTUAL_FINGERPRINT" != "$EXPECTED_FINGERPRINT" ]; then
+            echo "Erro: fingerprint SSH do servidor não corresponde à esperada."
+            exit 1
+          fi
+
+          echo "Fingerprint SSH validada."
+
+          # Remover entradas anteriores do mesmo host após validar a nova chave.
+          ssh-keygen -R "$EC2_HOST" -f "$KNOWN_HOSTS" >/dev/null 2>&1 || true
+          ssh-keygen -R "[$EC2_HOST]:$EC2_SSH_PORT" \
+            -f "$KNOWN_HOSTS" >/dev/null 2>&1 || true
+
+          printf '%s\n' "$SCAN_RESULT" >> "$KNOWN_HOSTS"
+          chmod 600 "$KNOWN_HOSTS"
+
+          # Exigir validação da identidade do servidor em SSH e SCP.
+          SSH_OPTS=(
+            -p "$EC2_SSH_PORT"
+            -o IdentitiesOnly=yes
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$KNOWN_HOSTS"
+          )
+
+          SCP_OPTS=(
+            -P "$EC2_SSH_PORT"
+            -o IdentitiesOnly=yes
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$KNOWN_HOSTS"
+          )
+
+          # Preparar o diretório remoto.
+          ssh -i "$KEY_FILE" "${SSH_OPTS[@]}" \
             "$EC2_USER@$EC2_HOST" \
             "mkdir -p '$DEPLOY_DIR'"
 
@@ -95,15 +147,13 @@ jobs:
             --exclude='*.pyc' \
             -czf "$ARCHIVE" .
 
-          scp -i "$KEY_FILE" \
-            -P "$EC2_SSH_PORT" \
-            -o IdentitiesOnly=yes \
-            -o BatchMode=yes \
+          # Transferir o pacote para o servidor.
+          scp -i "$KEY_FILE" "${SCP_OPTS[@]}" \
             "$ARCHIVE" \
             "$EC2_USER@$EC2_HOST:/tmp/desafio-esss-${GITHUB_RUN_ID}.tar.gz"
 
-          # Extrair os arquivos e implantar a aplicação.
-          ssh -i "$KEY_FILE" $SSH_OPTS \
+          # Extrair os arquivos e atualizar os serviços.
+          ssh -i "$KEY_FILE" "${SSH_OPTS[@]}" \
             "$EC2_USER@$EC2_HOST" \
             "set -eu
             tar -xzf '/tmp/desafio-esss-${GITHUB_RUN_ID}.tar.gz' -C '$DEPLOY_DIR'
@@ -112,8 +162,8 @@ jobs:
             sudo docker compose up -d --build
             sudo docker compose ps"
 
-          # Executar o script de health check no servidor remoto.
-          ssh -i "$KEY_FILE" $SSH_OPTS \
+          # Confirmar que a API responde HTTP 200.
+          ssh -i "$KEY_FILE" "${SSH_OPTS[@]}" \
             "$EC2_USER@$EC2_HOST" \
             "bash '$DEPLOY_DIR/scripts/healthcheck.sh' \
             http://localhost:8000/health 12 5"
