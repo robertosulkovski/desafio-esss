@@ -232,7 +232,9 @@ A tabela `tasks` é criada pela aplicação com `CREATE TABLE IF NOT EXISTS`, ev
 
 ## Evidências da execução
 
-O workflow foi executado com sucesso no GitHub Actions após o commit que adicionou o script reutilizável de health check.
+O pipeline CI/CD é acionado automaticamente a cada push para a branch main. A execução realiza as etapas de validação, implantação na instância EC2 e health check da API. O sucesso pode ser confirmado no GitHub Actions e pela resposta HTTP 200 do endpoint /health.
+
+
 
 **Execução do workflow:** [Consultar GitHub Actions](https://github.com/robertosulkovski/desafio-esss/actions)
 
